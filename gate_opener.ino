@@ -1,23 +1,24 @@
 #include <FiniteStateMachine.h>
 
 //**** Config section ****/
-const float SLOW_START_TIME = 1.0;
-const float MOVE_TIME = 10.0;
-const float CLOSE_AFTER_TIME = 20.0;
-const float MAX_AMPS = 3.0;
+const float SLOW_START_TIME = 2.0;
+const float MOVE_TIME = 6.0;
+const float CLOSE_AFTER_TIME = 5.0;
+const float MAX_AMPS = 200.0;
 
 //**** Input output section ****/
 const int OPEN_PIN = 10;
 const int CLOSE_PIN = 11;
-const int BUTTON_PIN = 2;
-const int CURRENT_SENSOR_PIN = 4;
-
+const int AUTO_BUTTON_PIN = 2;
+const int MANUAL_OPEN_PIN = 3;
+const int MANUAL_CLOSE_PIN = 4;
+const int CURRENT_SENSOR_PIN = 1;
+const int MAX_DUTY_CYCLE = 255;
 
 //**** State machine and gate operation ****/
-const byte NUMBER_OF_SELECATBLE_STATES = 4;
+const byte NUMBER_OF_SELECATBLE_STATES = 5;
 int movingPin;
 int stoppedPin;
-int operateAttempts = 0;
 void gateIsClosedUpdate();
 void setOpen();
 void moveRoutine();
@@ -37,35 +38,61 @@ const int SMOOTHING_SIZE = 10;
 int current_readings[SMOOTHING_SIZE];
 int current_index = 0;
 int current_sum = 0;
+int ignore_amps_buffer = 0;
 
+//**** Bump detection ****/
+int recover_attempts = 0;
+float bumped_object_time = 0;
 
-
-float readAmps(){
-  current_sum = current_sum - current_readings[current_index];
-  current_readings[current_index] = analogRead(CURRENT_SENSOR_PIN);
-  current_sum = current_sum + current_readings[current_index];
-  current_index++;
-  current_index = current_index >= SMOOTHING_SIZE ? 0 : current_index;
-  return current_sum / SMOOTHING_SIZE;
-}
+//**** External Control ****/
+bool stay_open = false;
+bool manual_apply_brake = false;
+int open_button_state = LOW;
+int close_button_state = LOW;
+int auto_button_state = LOW;
 
 void gateIsClosedUpdate() {
-  Serial.println("gateIsClosedUpdate");
-  int buttonState = digitalRead(BUTTON_PIN);
+  //Serial.println("gateIsClosedUpdate");
+  recover_attempts = 0;
+  auto_button_state = digitalRead(AUTO_BUTTON_PIN);
 
   // check if the pushbutton is pressed.
-  if (buttonState == HIGH) {
+  if (auto_button_state == HIGH) {
     stateMachine.transitionTo(gateIsOpening);
-  }else{
-    analogWrite(movingPin, LOW);
-    analogWrite(stoppedPin, LOW);
   }
+  manualMove();
 }
 
 void gateIsOpenUpdate(){
-  Serial.println("gateIsOpenUpdate");
-  if(stateMachine.timeInCurrentState() > CLOSE_AFTER_TIME){
+  //Serial.println("gateIsOpenUpdate");
+  if(stateMachine.timeInCurrentState() > CLOSE_AFTER_TIME && recover_attempts == 0 && !stay_open){
     stateMachine.transitionTo(gateIsClosing);
+  }
+}
+
+void currentOverloadUpdate(){
+  Serial.println("Stalled please reset gate position manually");
+  manualMove();
+}
+
+void manualMove(){
+  open_button_state = digitalRead(MANUAL_OPEN_PIN);
+  close_button_state = digitalRead(MANUAL_CLOSE_PIN);
+  // check if the pushbutton is pressed.
+  if (open_button_state == HIGH) {
+    //Manually Open Gate while button held
+    setOpen();
+    manual_apply_brake = true;
+    analogWrite(movingPin,MAX_DUTY_CYCLE);    
+  }else if (close_button_state == HIGH) {
+    //Manually Close gate while button held
+    setClose();
+    manual_apply_brake = true;
+    analogWrite(movingPin,MAX_DUTY_CYCLE);
+  }else if (close_button_state != HIGH && open_button_state != HIGH){
+    if(manual_apply_brake) {
+      setBrake();  
+    }
   }
 }
 
@@ -82,55 +109,59 @@ void setClose(){
 }
 
 void setBrake(){
-  Serial.println("setBrake");
   //Set pins to brake position
-  analogWrite(movingPin, 255);
-  analogWrite(stoppedPin, 255);
+  analogWrite(movingPin, MAX_DUTY_CYCLE);
+  analogWrite(stoppedPin, MAX_DUTY_CYCLE);
   //allow brake to take effect
   delay(150);
 }
 
 void moveRoutine(){
   bool closed = false;
-  float timeInState = stateMachine.timeInCurrentState();
+  float timeInState = bumped_object_time > 0 ? MOVE_TIME - bumped_object_time + stateMachine.timeInCurrentState() : stateMachine.timeInCurrentState(); //If we bumped object, place gate back to prior position via timing
   float amps = readAmps();
+  int duty_cycle = MAX_DUTY_CYCLE;
   
   if(timeInState < SLOW_START_TIME){
-    //Serial.println("slowStart");
-    //convert to 1-255 duty cycle
-    int duty_cycle = 255/SLOW_START_TIME*timeInState;
+    duty_cycle = MAX_DUTY_CYCLE/SLOW_START_TIME*timeInState;    //convert to 1:MAX_DUTY_CYCLE duty cycle range based on time
     analogWrite(movingPin,duty_cycle);
-  }else if(SLOW_START_TIME < timeInState && timeInState < (MOVE_TIME - SLOW_START_TIME)){
-    //Serial.println("operate operator");
-    analogWrite(movingPin,255);
-  }else if(SLOW_START_TIME < timeInState && timeInState < MOVE_TIME){
-    //Serial.println("slow stop");
-    //convert to 255-1 duty cycle
-    int duty_cycle = 255/SLOW_START_TIME*(MOVE_TIME - timeInState);
+  }else if(SLOW_START_TIME <= timeInState && timeInState <= (MOVE_TIME - SLOW_START_TIME)){
+    analogWrite(movingPin,duty_cycle);
+  }else if(SLOW_START_TIME <= timeInState && timeInState <= MOVE_TIME){
+    duty_cycle = MAX_DUTY_CYCLE/SLOW_START_TIME*(MOVE_TIME - timeInState);    //convert to MAX_DUTY_CYCLE:1 duty cycle range based on time
     analogWrite(movingPin,duty_cycle);
     if(amps > MAX_AMPS){
       closed = true;
+      resetAmpReadings();
       transitionOutOfMove();
     }
-  }else{    
-    //Serial.println("stop gate and move to next state");
+  }else{
+    //time is up, transition out
+    bumped_object_time = 0;
     transitionOutOfMove();
   }
   
   if(amps > MAX_AMPS && !closed){
-    operateAttempts++;
-    if(operateAttempts > 1){
+    Serial.println("Gate bumped object!!");
+    bumped_object_time = stateMachine.timeInCurrentState();
+    setBrake();
+    if(recover_attempts >= 1){
       stateMachine.transitionTo(currentOverload);
-    }
-    if(stateMachine.isInState(gateIsOpening)){
-      stateMachine.transitionTo(gateIsClosing);
     }else{
-      stateMachine.transitionTo(gateIsOpening);
-    }
+      recover_attempts++;
+      resetAmpReadings();
+      ignore_amps_buffer = 1000;
+      if(stateMachine.isInState(gateIsOpening)){
+        stateMachine.transitionTo(gateIsClosing);
+      }else{
+        stateMachine.transitionTo(gateIsOpening);
+      }
+    }  
   }
 }
 
 void transitionOutOfMove(){
+  Serial.println("transitionOutOfMove");
   analogWrite(movingPin,LOW);
   if(stateMachine.isInState(gateIsOpening)){
     stateMachine.transitionTo(gateIsOpen);
@@ -139,25 +170,41 @@ void transitionOutOfMove(){
   }
 }
 
-void currentOverloadUpdate(){
+float readAmps(){
+  if(ignore_amps_buffer > 0){
+    ignore_amps_buffer--;
+    return 0;
+  }
+  current_sum = current_sum - current_readings[current_index];
+  current_readings[current_index] = analogRead(CURRENT_SENSOR_PIN);
+  current_sum = current_sum + current_readings[current_index];  
+  current_index++;
+  current_index = current_index >= SMOOTHING_SIZE ? 0 : current_index;
   
+  return current_sum / SMOOTHING_SIZE;
+}
+
+void resetAmpReadings(){
+  memset(current_readings, 0, sizeof(current_readings));
+  current_index = 0;
+  current_sum = 0;
 }
 
 void setup() {
   //Initialize gate to Open state
-  Serial.begin(9600);
-  Serial.println("OpenMyGate v 0.1");
+  Serial.begin(115200);
+  Serial.println("GateBrain v 0.2");
 
   //Set up pins
   pinMode(movingPin, OUTPUT);
   pinMode(stoppedPin, OUTPUT);
-  pinMode(BUTTON_PIN, INPUT);
+  pinMode(AUTO_BUTTON_PIN, INPUT);
+  pinMode(MANUAL_OPEN_PIN, INPUT);
+  pinMode(MANUAL_CLOSE_PIN, INPUT);
   pinMode(CURRENT_SENSOR_PIN, INPUT);
 
   //Initialize current sensing array
-  for (int i = 0; i < SMOOTHING_SIZE; i++) {
-    current_readings[i] = 0;
-  }
+  resetAmpReadings();
   
   //Get timings from EEPROM
 
