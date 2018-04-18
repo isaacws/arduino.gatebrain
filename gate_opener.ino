@@ -17,8 +17,8 @@ const int MAX_DUTY_CYCLE = 255;
 
 //**** State machine and gate operation ****/
 const byte NUMBER_OF_SELECATBLE_STATES = 5;
-int movingPin;
-int stoppedPin;
+int moving_pin;
+int stopped_pin;
 void gateIsClosedUpdate();
 void setOpen();
 void moveRoutine();
@@ -52,7 +52,6 @@ int close_button_state = LOW;
 int auto_button_state = LOW;
 
 void gateIsClosedUpdate() {
-  //Serial.println("gateIsClosedUpdate");
   recover_attempts = 0;
   auto_button_state = digitalRead(AUTO_BUTTON_PIN);
 
@@ -64,7 +63,6 @@ void gateIsClosedUpdate() {
 }
 
 void gateIsOpenUpdate(){
-  //Serial.println("gateIsOpenUpdate");
   if(stateMachine.timeInCurrentState() > CLOSE_AFTER_TIME && recover_attempts == 0 && !stay_open){
     stateMachine.transitionTo(gateIsClosing);
   }
@@ -83,12 +81,12 @@ void manualMove(){
     //Manually Open Gate while button held
     setOpen();
     manual_apply_brake = true;
-    analogWrite(movingPin,MAX_DUTY_CYCLE);    
+    analogWrite(moving_pin,MAX_DUTY_CYCLE);    
   }else if (close_button_state == HIGH) {
     //Manually Close gate while button held
     setClose();
     manual_apply_brake = true;
-    analogWrite(movingPin,MAX_DUTY_CYCLE);
+    analogWrite(moving_pin,MAX_DUTY_CYCLE);
   }else if (close_button_state != HIGH && open_button_state != HIGH){
     if(manual_apply_brake) {
       setBrake();  
@@ -97,39 +95,39 @@ void manualMove(){
 }
 
 void setOpen(){
-  movingPin = OPEN_PIN;
-  stoppedPin = CLOSE_PIN;
-  digitalWrite(stoppedPin, LOW);
+  moving_pin = OPEN_PIN;
+  stopped_pin = CLOSE_PIN;
+  digitalWrite(stopped_pin, LOW);
 }
 
 void setClose(){
-  movingPin = CLOSE_PIN;
-  stoppedPin = OPEN_PIN;
-  digitalWrite(stoppedPin, LOW);
+  moving_pin = CLOSE_PIN;
+  stopped_pin = OPEN_PIN;
+  digitalWrite(stopped_pin, LOW);
 }
 
 void setBrake(){
   //Set pins to brake position
-  analogWrite(movingPin, MAX_DUTY_CYCLE);
-  analogWrite(stoppedPin, MAX_DUTY_CYCLE);
+  analogWrite(moving_pin, MAX_DUTY_CYCLE);
+  analogWrite(stopped_pin, MAX_DUTY_CYCLE);
   //allow brake to take effect
   delay(150);
 }
 
 void moveRoutine(){
   bool closed = false;
-  float timeInState = bumped_object_time > 0 ? MOVE_TIME - bumped_object_time + stateMachine.timeInCurrentState() : stateMachine.timeInCurrentState(); //If we bumped object, place gate back to prior position via timing
+  float time_in_state = bumped_object_time > 0 ? MOVE_TIME - bumped_object_time + stateMachine.timeInCurrentState() : stateMachine.timeInCurrentState(); //If we bumped object, place gate back to prior position via timing
   float amps = readAmps();
   int duty_cycle = MAX_DUTY_CYCLE;
   
-  if(timeInState < SLOW_START_TIME){
-    duty_cycle = MAX_DUTY_CYCLE/SLOW_START_TIME*timeInState;    //convert to 1:MAX_DUTY_CYCLE duty cycle range based on time
-    analogWrite(movingPin,duty_cycle);
-  }else if(SLOW_START_TIME <= timeInState && timeInState <= (MOVE_TIME - SLOW_START_TIME)){
-    analogWrite(movingPin,duty_cycle);
-  }else if(SLOW_START_TIME <= timeInState && timeInState <= MOVE_TIME){
-    duty_cycle = MAX_DUTY_CYCLE/SLOW_START_TIME*(MOVE_TIME - timeInState);    //convert to MAX_DUTY_CYCLE:1 duty cycle range based on time
-    analogWrite(movingPin,duty_cycle);
+  if(time_in_state < SLOW_START_TIME){
+    duty_cycle = MAX_DUTY_CYCLE/SLOW_START_TIME*time_in_state;    //convert to 1:MAX_DUTY_CYCLE duty cycle range based on time
+    analogWrite(moving_pin,duty_cycle);
+  }else if(SLOW_START_TIME <= time_in_state && time_in_state <= (MOVE_TIME - SLOW_START_TIME)){
+    analogWrite(moving_pin,duty_cycle);
+  }else if(SLOW_START_TIME <= time_in_state && time_in_state <= MOVE_TIME){
+    duty_cycle = MAX_DUTY_CYCLE/SLOW_START_TIME*(MOVE_TIME - time_in_state);    //convert to MAX_DUTY_CYCLE:1 duty cycle range based on time
+    analogWrite(moving_pin,duty_cycle);
     if(amps > MAX_AMPS){
       closed = true;
       resetAmpReadings();
@@ -161,8 +159,7 @@ void moveRoutine(){
 }
 
 void transitionOutOfMove(){
-  Serial.println("transitionOutOfMove");
-  analogWrite(movingPin,LOW);
+  analogWrite(moving_pin,LOW);
   if(stateMachine.isInState(gateIsOpening)){
     stateMachine.transitionTo(gateIsOpen);
   }else{
@@ -196,8 +193,8 @@ void setup() {
   Serial.println("GateBrain v 0.2");
 
   //Set up pins
-  pinMode(movingPin, OUTPUT);
-  pinMode(stoppedPin, OUTPUT);
+  pinMode(moving_pin, OUTPUT);
+  pinMode(stopped_pin, OUTPUT);
   pinMode(AUTO_BUTTON_PIN, INPUT);
   pinMode(MANUAL_OPEN_PIN, INPUT);
   pinMode(MANUAL_CLOSE_PIN, INPUT);
