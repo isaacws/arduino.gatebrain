@@ -1,19 +1,35 @@
+#include <ESP8266WiFi.h>
+#include <PubSubClient.h>
+#include <ESP8266mDNS.h>
+#include <WiFiUdp.h>
+#include <ArduinoOTA.h>
+#include <EEPROM.h>
+
 #include <FiniteStateMachine.h>
+
+//**** MQTT ****/
+const char* mqtt_server = "192.168.0.112";
+const char* mqtt_username = "***";
+const char* mqtt_password = "***";
+
+//**** WiFi ****/
+const char* ssid = "***";
+const char* password = "***";
 
 //**** Config section ****/
 const float SLOW_START_TIME = 2.0;
-const float MOVE_TIME = 6.0;
-const float CLOSE_AFTER_TIME = 5.0;
-const float MAX_AMPS = 200.0;
+float MOVE_TIME = 10.0;
+float CLOSE_AFTER_TIME = 35.0;
+const float MAX_AMPS = 300.0;
 
 //**** Input output section ****/
-const int OPEN_PIN = 10;
-const int CLOSE_PIN = 11;
-const int AUTO_BUTTON_PIN = 2;
-const int MANUAL_OPEN_PIN = 3;
-const int MANUAL_CLOSE_PIN = 4;
-const int CURRENT_SENSOR_PIN = 1;
-const int MAX_DUTY_CYCLE = 255;
+const int OPEN_PIN = D1;
+const int CLOSE_PIN = D2;
+const int AUTO_BUTTON_PIN = D5;
+const int MANUAL_OPEN_PIN = D6;
+const int MANUAL_CLOSE_PIN = D7;
+const int CURRENT_SENSOR_PIN = A0;
+const int MAX_DUTY_CYCLE = 1024;
 
 //**** State machine and gate operation ****/
 const byte NUMBER_OF_SELECATBLE_STATES = 5;
@@ -39,6 +55,7 @@ int current_readings[SMOOTHING_SIZE];
 int current_index = 0;
 int current_sum = 0;
 int ignore_amps_buffer = 0;
+float readAmps();
 
 //**** Bump detection ****/
 int recover_attempts = 0;
@@ -50,10 +67,135 @@ bool manual_apply_brake = false;
 int open_button_state = LOW;
 int close_button_state = LOW;
 int auto_button_state = LOW;
+void manualMove();
+
+/*Wifi*/
+WiFiClient espClient;
+void setup_wifi() {
+
+  delay(10);
+  // We start by connecting to a WiFi network
+  Serial.println();
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+
+  while (WiFi.waitForConnectResult() != WL_CONNECTED) {
+    Serial.println("Connection Failed! Rebooting...");
+    delay(5000);
+    ESP.restart();
+  }
+  randomSeed(micros());
+
+   // Port defaults to 8266
+  // ArduinoOTA.setPort(8266);
+
+  // Hostname defaults to esp8266-[ChipID]
+  // ArduinoOTA.setHostname("myesp8266");
+
+  // No authentication by default
+  // ArduinoOTA.setPassword("admin");
+
+  // Password can be set with it's md5 value as well
+  // MD5(admin) = 21232f297a57a5a743894a0e4a801fc3
+  // ArduinoOTA.setPasswordHash("21232f297a57a5a743894a0e4a801fc3");
+
+  ArduinoOTA.onStart([]() {
+    String type;
+    if (ArduinoOTA.getCommand() == U_FLASH)
+      type = "sketch";
+    else // U_SPIFFS
+      type = "filesystem";
+
+    // NOTE: if updating SPIFFS this would be the place to unmount SPIFFS using SPIFFS.end()
+    Serial.println("Start updating " + type);
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println("\nEnd");
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("Error[%u]: ", error);
+    if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+    else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+    else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+    else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+    else if (error == OTA_END_ERROR) Serial.println("End Failed");
+  });
+  ArduinoOTA.begin();
+  Serial.println("Ready");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+}
+
+/*MQTT*/
+PubSubClient client(espClient);
+long lastMsg = 0;
+char msg[50];
+int value = 0;
+
+void reconnect() {
+  // Loop until we're reconnected
+  while (!client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    // Create a random client ID
+    String clientId = "ESP8266Client-";
+    clientId += String(random(0xffff), HEX);
+    // Attempt to connect
+    if (client.connect(clientId.c_str(), mqtt_username, mqtt_password)) {
+      Serial.println("connected to mqtt");
+      client.subscribe("gate/#");
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" try again in 5 seconds");
+      // Wait 5 seconds before retrying
+      delay(5000);
+    }
+  }
+}
+
+void callback(char* topic, byte* payload, unsigned int length) {
+  Serial.print("Message arrived [");
+  Serial.print(topic);
+  Serial.print("] ");
+  for (int i = 0; i < length; i++) {
+    Serial.print((char)payload[i]);
+  }
+  Serial.println();
+
+  // If we got an open message, transition state machine
+  if (strcmp(topic, "gate/Cycle") == 0) {
+    payload[length] = '\0';
+    String s = String((char*)payload);
+    CLOSE_AFTER_TIME = s.toFloat();
+    stateMachine.transitionTo(gateIsOpening);
+  }
+  if (strcmp(topic, "gate/Open") == 0) {
+    stay_open = true;
+    stateMachine.transitionTo(gateIsOpening);
+  }
+  if (strcmp(topic, "gate/Close") == 0) {
+    stay_open = false;
+  }
+
+  if (strcmp(topic, "gate/SetMoveTime") == 0) {
+    payload[length] = '\0';
+    String s = String((char*)payload);
+    MOVE_TIME = s.toFloat();
+    setMoveTime(MOVE_TIME);
+  }
+}
 
 void gateIsClosedUpdate() {
+  //Serial.println("closed update");
   recover_attempts = 0;
   auto_button_state = digitalRead(AUTO_BUTTON_PIN);
+  //Serial.println(digitalRead(MANUAL_OPEN_PIN));
 
   // check if the pushbutton is pressed.
   if (auto_button_state == HIGH) {
@@ -81,7 +223,7 @@ void manualMove(){
     //Manually Open Gate while button held
     setOpen();
     manual_apply_brake = true;
-    analogWrite(moving_pin,MAX_DUTY_CYCLE);    
+    analogWrite(moving_pin,MAX_DUTY_CYCLE);   
   }else if (close_button_state == HIGH) {
     //Manually Close gate while button held
     setClose();
@@ -173,7 +315,7 @@ float readAmps(){
     return 0;
   }
   current_sum = current_sum - current_readings[current_index];
-  current_readings[current_index] = analogRead(CURRENT_SENSOR_PIN);
+  current_readings[current_index] = analogRead(A0);
   current_sum = current_sum + current_readings[current_index];  
   current_index++;
   current_index = current_index >= SMOOTHING_SIZE ? 0 : current_index;
@@ -187,11 +329,24 @@ void resetAmpReadings(){
   current_sum = 0;
 }
 
+void setMoveTime(float time){
+   Serial.println(time);
+  uint addr = 0;
+  struct { 
+    float val = 0;
+    char label[20] = "";
+  } data;
+  data.val = time;
+  strncpy(data.label, "MOVE_TIME",20);
+  EEPROM.put(addr,data);
+  EEPROM.commit(); 
+}
+
 void setup() {
   //Initialize gate to Open state
-  Serial.begin(115200);
+  Serial.begin(9600);
   Serial.println("GateBrain v 0.2");
-
+  
   //Set up pins
   pinMode(moving_pin, OUTPUT);
   pinMode(stopped_pin, OUTPUT);
@@ -204,11 +359,37 @@ void setup() {
   resetAmpReadings();
   
   //Get timings from EEPROM
+  uint addr = 0;
+  struct { 
+    float val = 0;
+    char label[20] = "";
+  } data;
 
-  //Initialize current readings array
-  
+  EEPROM.begin(512);
+
+  EEPROM.get(addr,data);
+  Serial.println("Move Time Values are: " + String(data.val) + "," + String(data.label));
+
+  if ( strcmp(data.label,"MOVE_TIME") == 0 )
+  {    
+     MOVE_TIME = data.val;
+  } 
+
+//  data.val = 0; 
+//  strncpy(data.label,"",20);
+
+  //Connect to wifi
+  setup_wifi();
+  //MQTT connect
+  client.setServer(mqtt_server, 1883);
+  client.setCallback(callback);
 }
 
 void loop() {
+  if (!client.connected()) {
+    reconnect();
+  }
+  client.loop();
+  ArduinoOTA.handle();
   stateMachine.update();
 }
