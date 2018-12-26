@@ -10,11 +10,11 @@
 //**** MQTT ****/
 const char* mqtt_server = "192.168.0.112";
 const char* mqtt_username = "***";
-const char* mqtt_password = "***";
+const char* mqtt_password = "**";
 
 //**** WiFi ****/
-const char* ssid = "***";
-const char* password = "***";
+const char* ssid = "**";
+const char* password = "**";
 
 //**** Config section ****/
 const float SLOW_START_TIME = 2.0;
@@ -173,6 +173,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
     payload[length] = '\0';
     String s = String((char*)payload);
     CLOSE_AFTER_TIME = s.toFloat();
+    stay_open = false;
     stateMachine.transitionTo(gateIsOpening);
   }
   if (strcmp(topic, "gate/Open") == 0) {
