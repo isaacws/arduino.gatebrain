@@ -8,19 +8,20 @@
 #include <FiniteStateMachine.h>
 
 //**** MQTT ****/
-const char* mqtt_server = "192.168.0.112";
+const char* mqtt_server = "192.168.0.xx";
 const char* mqtt_username = "***";
-const char* mqtt_password = "**";
+const char* mqtt_password = "***";
+long lastMQTTReconnectAttempt = 0;
 
 //**** WiFi ****/
-const char* ssid = "**";
-const char* password = "**";
+const char* ssid = "guest";
+const char* password = "24707guest";
 
 //**** Config section ****/
-const float SLOW_START_TIME = 2.0;
+const float SLOW_START_TIME = 2.5;
 float MOVE_TIME = 10.0;
 float CLOSE_AFTER_TIME = 35.0;
-const float MAX_AMPS = 300.0;
+float MAX_AMPS = 750.0;
 
 //**** Input output section ****/
 const int OPEN_PIN = D1;
@@ -56,6 +57,7 @@ int current_index = 0;
 int current_sum = 0;
 int ignore_amps_buffer = 0;
 float readAmps();
+long startMillis;
 
 //**** Bump detection ****/
 int recover_attempts = 0;
@@ -138,24 +140,19 @@ long lastMsg = 0;
 char msg[50];
 int value = 0;
 
-void reconnect() {
-  // Loop until we're reconnected
-  while (!client.connected()) {
-    Serial.print("Attempting MQTT connection...");
-    // Create a random client ID
-    String clientId = "ESP8266Client-";
-    clientId += String(random(0xffff), HEX);
-    // Attempt to connect
-    if (client.connect(clientId.c_str(), mqtt_username, mqtt_password)) {
-      Serial.println("connected to mqtt");
-      client.subscribe("gate/#");
-    } else {
-      Serial.print("failed, rc=");
-      Serial.print(client.state());
-      Serial.println(" try again in 5 seconds");
-      // Wait 5 seconds before retrying
-      delay(5000);
-    }
+bool reconnect() {
+  Serial.print("Attempting MQTT connection...");
+  // Create a client ID
+  String clientId = "ESP8266Client-";
+  clientId += WiFi.macAddress();
+  // Attempt to connect
+  if (client.connect(clientId.c_str(), mqtt_username, mqtt_password)) {
+    Serial.println("connected to mqtt");
+    client.subscribe("gate/#");
+  } else {
+    Serial.print("failed, rc=");
+    Serial.print(client.state());
+    Serial.println(" try again in 5 seconds");
   }
 }
 
@@ -174,29 +171,61 @@ void callback(char* topic, byte* payload, unsigned int length) {
     String s = String((char*)payload);
     CLOSE_AFTER_TIME = s.toFloat();
     stay_open = false;
-    stateMachine.transitionTo(gateIsOpening);
+    if(stateMachine.isInState(gateIsClosed)){
+      stateMachine.transitionTo(gateIsOpening);
+    }
   }
   if (strcmp(topic, "gate/Open") == 0) {
     stay_open = true;
-    stateMachine.transitionTo(gateIsOpening);
+    if(stateMachine.isInState(gateIsClosed)){
+      stateMachine.transitionTo(gateIsOpening);
+    }
   }
   if (strcmp(topic, "gate/Close") == 0) {
     stay_open = false;
+  }
+  if (strcmp(topic, "gate/Reset") == 0) {
+    payload[length] = '\0';
+    String s = String((char*)payload);
+    if(s == "open"){
+      stateMachine.immediateTransitionTo(gateIsOpen);
+    }
+    if(s == "close"){
+      stateMachine.immediateTransitionTo(gateIsClosed);
+    }
+    stay_open = false;
+    recover_attempts = 0;
   }
 
   if (strcmp(topic, "gate/SetMoveTime") == 0) {
     payload[length] = '\0';
     String s = String((char*)payload);
     MOVE_TIME = s.toFloat();
-    setMoveTime(MOVE_TIME);
+    setEEPROM("MOVE_TIME", MOVE_TIME, 0);
+  }
+
+  if (strcmp(topic, "gate/SetMaxAmps") == 0) {
+    payload[length] = '\0';
+    String s = String((char*)payload);
+    MAX_AMPS = s.toFloat();
+    setEEPROM("MAX_AMPS", MAX_AMPS, 24);
   }
 }
 
+void setEEPROM(String label, float value, uint addr){
+  struct { 
+    float val = 0;
+    char label[20] = "";
+  } data;
+  data.val = value;
+  label.toCharArray(data.label, 20);
+  EEPROM.put(addr,data);
+  EEPROM.commit(); 
+}
+
 void gateIsClosedUpdate() {
-  //Serial.println("closed update");
   recover_attempts = 0;
   auto_button_state = digitalRead(AUTO_BUTTON_PIN);
-  //Serial.println(digitalRead(MANUAL_OPEN_PIN));
 
   // check if the pushbutton is pressed.
   if (auto_button_state == HIGH) {
@@ -238,12 +267,14 @@ void manualMove(){
 }
 
 void setOpen(){
+  Serial.println("Opening Gate");
   moving_pin = OPEN_PIN;
   stopped_pin = CLOSE_PIN;
   digitalWrite(stopped_pin, LOW);
 }
 
 void setClose(){
+  Serial.println("Closing Gate");
   moving_pin = CLOSE_PIN;
   stopped_pin = OPEN_PIN;
   digitalWrite(stopped_pin, LOW);
@@ -278,7 +309,6 @@ void moveRoutine(){
     }
   }else{
     //time is up, transition out
-    bumped_object_time = 0;
     transitionOutOfMove();
   }
   
@@ -286,12 +316,14 @@ void moveRoutine(){
     Serial.println("Gate bumped object!!");
     bumped_object_time = stateMachine.timeInCurrentState();
     setBrake();
+    
     if(recover_attempts >= 1){
       stateMachine.transitionTo(currentOverload);
     }else{
       recover_attempts++;
       resetAmpReadings();
       ignore_amps_buffer = 1000;
+    
       if(stateMachine.isInState(gateIsOpening)){
         stateMachine.transitionTo(gateIsClosing);
       }else{
@@ -303,6 +335,9 @@ void moveRoutine(){
 
 void transitionOutOfMove(){
   analogWrite(moving_pin,LOW);
+  Serial.print("Done with move. Time in move");
+  Serial.println(stateMachine.timeInCurrentState());
+  bumped_object_time = 0;
   if(stateMachine.isInState(gateIsOpening)){
     stateMachine.transitionTo(gateIsOpen);
   }else{
@@ -311,16 +346,17 @@ void transitionOutOfMove(){
 }
 
 float readAmps(){
-  if(ignore_amps_buffer > 0){
-    ignore_amps_buffer--;
-    return 0;
+  if(millis()%2 == 0){
+    if(ignore_amps_buffer > 0){
+      ignore_amps_buffer--;
+      return 0;
+    }
+    current_sum = current_sum - current_readings[current_index];
+    current_readings[current_index] = analogRead(A0);
+    current_sum = current_sum + current_readings[current_index];  
+    current_index++;
+    current_index = current_index >= SMOOTHING_SIZE ? 0 : current_index;
   }
-  current_sum = current_sum - current_readings[current_index];
-  current_readings[current_index] = analogRead(A0);
-  current_sum = current_sum + current_readings[current_index];  
-  current_index++;
-  current_index = current_index >= SMOOTHING_SIZE ? 0 : current_index;
-  
   return current_sum / SMOOTHING_SIZE;
 }
 
@@ -328,19 +364,6 @@ void resetAmpReadings(){
   memset(current_readings, 0, sizeof(current_readings));
   current_index = 0;
   current_sum = 0;
-}
-
-void setMoveTime(float time){
-   Serial.println(time);
-  uint addr = 0;
-  struct { 
-    float val = 0;
-    char label[20] = "";
-  } data;
-  data.val = time;
-  strncpy(data.label, "MOVE_TIME",20);
-  EEPROM.put(addr,data);
-  EEPROM.commit(); 
 }
 
 void setup() {
@@ -376,8 +399,14 @@ void setup() {
      MOVE_TIME = data.val;
   } 
 
-//  data.val = 0; 
-//  strncpy(data.label,"",20);
+  addr = 24;
+  EEPROM.get(addr,data);
+  Serial.println("Max Amp Values are: " + String(data.val) + "," + String(data.label));
+
+  if ( strcmp(data.label,"MAX_AMPS") == 0 )
+  {    
+     MAX_AMPS = data.val;
+  } 
 
   //Connect to wifi
   setup_wifi();
@@ -388,9 +417,17 @@ void setup() {
 
 void loop() {
   if (!client.connected()) {
-    reconnect();
+    long now = millis();
+    if (now - lastMQTTReconnectAttempt > 5000) {
+      lastMQTTReconnectAttempt = now;
+      if (reconnect()) {
+        lastMQTTReconnectAttempt = 0;
+      }
+    }
+  } else {
+    client.loop();
   }
-  client.loop();
+  
   ArduinoOTA.handle();
   stateMachine.update();
 }
